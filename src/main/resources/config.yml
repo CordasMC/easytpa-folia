@@ -4,6 +4,7 @@
 settings:
   request-timeout: 60 # time in seconds before a request expires
   cooldown: 30 # time in seconds between teleport requests
+  teleport-delay: 5 # time in seconds to wait before teleport after acceptance
   enable-sounds: true # whether to play sounds for teleport events
 
 messages:

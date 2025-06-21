@@ -1,178 +1,205 @@
 package com.maybeizen.EasyTPA.managers;
 
+import com.maybeizen.EasyTPA.EasyTPA;
+import com.maybeizen.EasyTPA.model.TeleportRequest;
+import com.maybeizen.EasyTPA.utils.MessageUtils;
 import org.bukkit.entity.Player;
 
-import org.bukkit.scheduler.BukkitRunnable;
-import com.maybeizen.EasyTPA.EasyTPA;
-import com.maybeizen.EasyTPA.utils.MessageUtils;
-
-import java.util.HashMap;
-import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 public class TPAManager {
-    private final EasyTPA plugin;
-    private final Map<UUID, UUID> tpaRequests; // target -> sender
-    private final Map<UUID, Long> cooldowns;
+	private final EasyTPA plugin;
+	private final CopyOnWriteArrayList<TeleportRequest> tpaRequests;
+	private final CooldownManager cooldownManager;
 
-    public TPAManager(EasyTPA plugin) {
-        this.plugin = plugin;
-        this.tpaRequests = new HashMap<>();
-        this.cooldowns = new HashMap<>();
-    }
+	public TPAManager(EasyTPA plugin) {
+		this.plugin = plugin;
+		this.tpaRequests = new CopyOnWriteArrayList<>();
+		this.cooldownManager = plugin.getCooldownManager();
+	}
 
-    public boolean sendRequest(Player sender, Player target) {
-        UUID senderUUID = sender.getUniqueId();
-        UUID targetUUID = target.getUniqueId();
+	public void addRequest(TeleportRequest request) {
+		Player target = request.getTarget();
+		Player sender = request.getSender();
 
-        if (!plugin.getToggleManager().isTPEnabled(target) && !sender.hasPermission("easytpa.bypass")) {
-            MessageUtils.sendMessage(sender,
-                plugin.getConfigManager().getMessage("target-has-tp-disabled"), 
-                "player", target.getName()
-            );
-            return false;
-        }
+		if (!plugin.getToggleManager().isTPEnabled(target) && !sender.hasPermission("easytpa.bypass")) {
+			MessageUtils.sendMessage(sender,
+					plugin.getConfigManager().getMessage("target-has-tp-disabled"),
+					"player", target.getName()
+			);
+			return;
+		}
 
-        if (!sender.hasPermission("easytpa.cooldown.bypass") && isOnCooldown(sender)) {
-            long remainingTime = (cooldowns.get(senderUUID) - System.currentTimeMillis()) / 1000;
-            MessageUtils.sendMessage(sender,
-                plugin.getConfigManager().getMessage("cooldown"), 
-                "time", String.valueOf(remainingTime)
-            );
-            return false;
-        }
+		if (!sender.hasPermission("easytpa.cooldown.bypass") && cooldownManager.hasCooldown(sender.getUniqueId())) {
+			long remainingTime = (cooldownManager.getRemainingTime(sender.getUniqueId()));
+			MessageUtils.sendMessage(sender,
+					plugin.getConfigManager().getMessage("cooldown"),
+					"time", String.valueOf(remainingTime)
+			);
+			return;
+		}
 
-        if (tpaRequests.containsKey(targetUUID)) {
-            MessageUtils.sendMessage(sender, plugin.getConfigManager().getMessage("already-has-request"));
-            return false;
-        }
+		if (hasIncomingRequest(target)) {
+			MessageUtils.sendMessage(sender, plugin.getConfigManager().getMessage("already-has-request"));
+			return;
+		}
 
-        tpaRequests.put(targetUUID, senderUUID);
-        
-        if (!sender.hasPermission("easytpa.cooldown.bypass")) {
-            setCooldown(sender);
-        }
+		// Add the new request
+		tpaRequests.add(request);
 
-        new BukkitRunnable() {
-            @Override
-            public void run() {
-                if (tpaRequests.containsKey(targetUUID) && tpaRequests.get(targetUUID).equals(senderUUID)) {
-                    tpaRequests.remove(targetUUID);
-                    MessageUtils.sendMessage(sender, plugin.getConfigManager().getMessage("request-expired"));
-                    if (target.isOnline()) {
-                        MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("request-expired-target"));
-                    }
-                }
-            }
-        }.runTaskLater(plugin, plugin.getConfigManager().getRequestTimeout() * 20L);
+		// Send the actual messages
+		MessageUtils.sendMessage(sender,
+				plugin.getConfigManager().getMessage("request-sent", sender,
+						"player", target.getName())
+		);
+		MessageUtils.sendTeleportRequest(sender, target);
 
-        return true;
-    }
+		if (!sender.hasPermission("easytpa.cooldown.bypass")) {
+			cooldownManager.setCooldown(sender.getUniqueId());
+		}
 
-    public boolean acceptRequest(Player target) {
-        UUID targetUUID = target.getUniqueId();
-        if (!tpaRequests.containsKey(targetUUID)) {
-            MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("no-pending-request"));
-            return false;
-        }
+		// schedule expiration using Folia scheduler
+		plugin.getServer().getAsyncScheduler().runDelayed(plugin, task -> {
+			// Is that same request still active? If yes, nuke that thing after the expiry time
+			if (getIncomingRequestOf(target) != null && getIncomingRequestOf(target).equals(request)) {
+				tpaRequests.remove(request);
+				MessageUtils.sendMessage(sender, plugin.getConfigManager().getMessage("request-expired"));
+				if (target.isOnline()) {
+					MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("request-expired-target"));
+				}
+			}
+		}, plugin.getConfigManager().getRequestTimeout(), TimeUnit.SECONDS);
 
-        UUID senderUUID = tpaRequests.get(targetUUID);
-        Player sender = plugin.getServer().getPlayer(senderUUID);
+	}
 
-        if (sender == null || !sender.isOnline()) {
-            MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("player-offline"));
-            tpaRequests.remove(targetUUID);
-            return false;
-        }
+	public void acceptRequest(Player target) {
+		UUID targetUUID = target.getUniqueId();
 
-        return performTeleport(sender, target);
-    }
-    
-    public boolean acceptRequestFrom(Player target, Player requester) {
-        UUID targetUUID = target.getUniqueId();
-        UUID requesterUUID = requester.getUniqueId();
-        
-        if (!tpaRequests.containsKey(targetUUID) || !tpaRequests.get(targetUUID).equals(requesterUUID)) {
-            MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("no-pending-request"));
-            return false;
-        }
-        
-        return performTeleport(requester, target);
-    }
+		// Do they have an incoming request that they could accept?
+		if (!hasIncomingRequest(target)) {
+			MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("no-pending-request"));
+			return;
+		}
 
-    private boolean performTeleport(Player sender, Player target) {
-        sender.teleport(target.getLocation());
-        
-        MessageUtils.sendMessage(sender,
-            plugin.getConfigManager().getMessage("request-accepted"), 
-            "player", target.getName()
-        );
-        
-        MessageUtils.sendMessage(target,
-            plugin.getConfigManager().getMessage("request-accepted-target"), 
-            "player", sender.getName()
-        );
-        
-        MessageUtils.playTeleportEffect(sender);
-        
-        tpaRequests.remove(target.getUniqueId());
-        
-        return true;
-    }
+		TeleportRequest requestToAccept = getIncomingRequestOf(target);
+		Player sender = requestToAccept.getSender();
 
-    public String denyRequest(Player target) {
-        UUID targetUUID = target.getUniqueId();
-        if (!tpaRequests.containsKey(targetUUID)) {
-            return null;
-        }
+		// The sender left or is invalid - nuke that request
+		if (sender == null || !sender.isOnline()) {
+			MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("player-offline"));
+			tpaRequests.remove(requestToAccept);
+			return;
+		}
 
-        UUID senderUUID = tpaRequests.get(targetUUID);
-        Player sender = plugin.getServer().getPlayer(senderUUID);
-        String senderName = sender != null ? sender.getName() : "Unknown";
+		// Schedule teleport with delay and cancellation support
+		requestToAccept.setCanceled(false);
+		scheduleTeleport(requestToAccept);
+	}
 
-        tpaRequests.remove(targetUUID);
+	public void acceptRequest(Player player, Player potentialRequester) {
+		if (!hasIncomingRequest(player) || !getIncomingRequestOf(player).getSender().equals(potentialRequester)) {
+			MessageUtils.sendMessage(player, plugin.getConfigManager().getMessage("no-pending-request"));
+			return;
+		}
 
-        if (sender != null && sender.isOnline()) {
-            MessageUtils.sendMessage(sender,
-                plugin.getConfigManager().getMessage("request-denied"), 
-                "player", target.getName()
-            );
-        }
+		TeleportRequest request = getIncomingRequestOf(player);
+		request.setCanceled(false);
+		scheduleTeleport(request);
+	}
 
-        return senderName;
-    }
-    
-    public boolean denyRequestFrom(Player target, Player requester) {
-        UUID targetUUID = target.getUniqueId();
-        UUID requesterUUID = requester.getUniqueId();
-        
-        if (!tpaRequests.containsKey(targetUUID) || !tpaRequests.get(targetUUID).equals(requesterUUID)) {
-            MessageUtils.sendMessage(target, plugin.getConfigManager().getMessage("no-pending-request"));
-            return false;
-        }
-        
-        tpaRequests.remove(targetUUID);
-        
-        MessageUtils.sendMessage(requester,
-            plugin.getConfigManager().getMessage("request-denied"), 
-            "player", target.getName()
-        );
-        
-        return true;
-    }
+	private void scheduleTeleport(TeleportRequest request) {
+		Player sender = request.getSender();
+		Player target = request.getTarget();
+		long delayTicks = plugin.getConfigManager().getTeleportDelay() * 20L;
+		MessageUtils.sendMessage(sender,
+				plugin.getConfigManager().getMessage("request-accepted"),
+				"player", target.getName()
+		);
+		MessageUtils.sendMessage(target,
+				plugin.getConfigManager().getMessage("request-accepted-target"),
+				"player", sender.getName()
+		);
 
-    public void clearAllRequests() {
-        tpaRequests.clear();
-        cooldowns.clear();
-    }
+		sender.getScheduler().runDelayed(plugin, task -> {
+			if (!request.isCanceled()) {
+				sender.teleportAsync(target.getLocation());
+				MessageUtils.sendMessage(sender,
+						plugin.getConfigManager().getMessage("teleport-success"),
+						"player", target.getName()
+				);
+				MessageUtils.playTeleportEffect(sender);
+			}
+			tpaRequests.remove(request);
+		}, null, delayTicks);
+	}
 
-    private boolean isOnCooldown(Player player) {
-        UUID uuid = player.getUniqueId();
-        return cooldowns.containsKey(uuid) && cooldowns.get(uuid) > System.currentTimeMillis();
-    }
+	public String denyRequest(Player player) {
+		if (!hasIncomingRequest(player)) {
+			return null;
+		}
 
-    private void setCooldown(Player player) {
-        UUID uuid = player.getUniqueId();
-        cooldowns.put(uuid, System.currentTimeMillis() + (plugin.getConfigManager().getCooldown() * 1000L));
-    }
-} 
+		Player sender = getIncomingRequestOf(player).getSender();
+		String senderName = sender != null && sender.isOnline() ? sender.getName() : "Unknown";
+
+		tpaRequests.remove(getIncomingRequestOf(player));
+
+		if (sender != null && sender.isOnline()) {
+			MessageUtils.sendMessage(sender,
+					plugin.getConfigManager().getMessage("request-denied"),
+					"player", player.getName()
+			);
+		}
+
+		return senderName;
+	}
+
+	public void denyRequest(Player player, Player requester) {
+		if (!hasIncomingRequest(player) || !getIncomingRequestOf(player).getSender().equals(requester)) {
+			MessageUtils.sendMessage(player, plugin.getConfigManager().getMessage("no-pending-request"));
+			return;
+		}
+
+		tpaRequests.remove(getIncomingRequestOf(player));
+
+		MessageUtils.sendMessage(requester,
+				plugin.getConfigManager().getMessage("request-denied"),
+				"player", player.getName()
+		);
+
+		MessageUtils.sendMessage(player,
+				plugin.getConfigManager().getMessage("request-denied-target"),
+				"player", requester.getName()
+		);
+
+	}
+
+	public void cancelRequest(Player player) {
+		TeleportRequest req = getIncomingRequestOf(player);
+		if (req != null) {
+			req.setCanceled(true);
+			tpaRequests.remove(req);
+		}
+	}
+
+	public void clearAllRequests() {
+		tpaRequests.clear();
+	}
+
+	public boolean hasIncomingRequest(Player player) {
+		for (TeleportRequest request : tpaRequests) {
+			if (request.getTarget().equals(player)) return true;
+		}
+
+		return false;
+	}
+
+	public TeleportRequest getIncomingRequestOf(Player player) {
+		for (TeleportRequest request : tpaRequests) {
+			if (request.getTarget().equals(player)) return request;
+		}
+
+		return null;
+	}
+}

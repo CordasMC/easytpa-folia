@@ -11,3 +11,7 @@ build
 *.log.tar.zip
 *.log.tar.tar
 *.log.tar.tar.gz
+/.idea
+./build.gradle
+build.gradle
+*.gradle

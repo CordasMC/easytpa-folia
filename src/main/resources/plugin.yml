@@ -1,9 +1,10 @@
 name: EasyTPA
 version: 1.2.0
 main: com.maybeizen.EasyTPA.EasyTPA
-api-version: "1.19"
-authors: [maybeizen]
+api-version: "1.21"
+authors: [maybeizen, Cordas]
 description: A simple yet powerful teleport request plugin
+folia-supported: true
 commands:
   tpa:
     description: Send a teleport request to another player
